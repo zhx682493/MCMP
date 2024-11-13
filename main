@@ -1,0 +1,265 @@
+#!/usr/bin/env python
+# coding: utf-8
+import argparse
+import collections
+import math
+import time
+
+import numpy as np
+import scipy.io as sio
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from einops import rearrange, repeat
+from sklearn import metrics, preprocessing
+from sklearn.decomposition import PCA
+from sklearn.metrics import confusion_matrix
+from model import HybridSN_network
+import geniter
+import record
+import torch_optimizer as optim2
+import Utils
+from torchsummary import summary
+
+torch.set_printoptions(threshold=np.inf)
+# # Setting Params
+
+parser = argparse.ArgumentParser(description='Training for HSI')
+parser.add_argument('-d', '--dataset', dest='dataset', default='IN', help="Name of dataset.")
+parser.add_argument('-o', '--optimizer', dest='optimizer', default='adam', help="Name of optimizer.")
+parser.add_argument('-e', '--epoch', type=int, dest='epoch', default=200, help="No of epoch")
+parser.add_argument('-i', '--iter', type=int, dest='iter', default=3, help="No of iter")
+parser.add_argument('-p', '--patch', type=int, dest='patch', default=6, help="Length of patch")
+parser.add_argument('-vs', '--valid_split', type=float, dest='valid_split', default=0.75,
+                    help="Percentage of validation split.")  # 将数据集按1:9的比例划分
+
+args = parser.parse_args()
+
+param_dataset = args.dataset  # UP,IN,SV, KSC
+param_epoch = args.epoch
+param_iter = args.iter
+patch_size = args.patch
+param_val = args.valid_split
+param_optim = args.optimizer
+
+# # Data Loading
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# for Monte Carlo runs
+seeds = [1331, 1332, 1333, 1334, 1335, 1336, 1337, 1338, 1339, 1340, 1341]
+ensemble = 1
+
+global Dataset  # UP,IN,SV, KSC
+dataset = param_dataset  # input('Please input the name of Dataset(IN, UP, SV, KSC):')
+Dataset = dataset.upper()
+
+
+def load_dataset(Dataset, split=0.75):  #
+    if Dataset == 'IN':
+        mat_data = sio.loadmat('Indian_pines_corrected.mat')
+        mat_gt = sio.loadmat('Indian_pines_gt.mat')
+        data_hsi = mat_data['indian_pines_corrected']  # [145,145,200]
+        gt_hsi = mat_gt['indian_pines_gt']  # [145,145]
+        total_size = 10249  # 只有10249个像素是地物像素其余1776个像素均为背景像素  145*145 = 21025 = 10776（背景，黑） + 10249（多种地物，彩）
+        validation_split = split
+        train_size = math.ceil(total_size * validation_split)  # 将数据等比例划分为1:9
+
+    shapeor = data_hsi.shape  # (145,145,200)
+    data_hsi = data_hsi.reshape(-1, data_hsi.shape[-1])  # (21025,200),将前两个数据相乘
+    shapeor = np.array(shapeor)
+    shapeor[-1] = K
+    data_hsi = data_hsi.reshape(shapeor)  # （145，145，30）
+
+    return data_hsi, gt_hsi, total_size, train_size, validation_split
+data_hsi, gt_hsi, total_size, train_size, validation_split = load_dataset(Dataset, param_val)
+print(data_hsi.shape)
+image_x, image_y, BAND = data_hsi.shape  # image_x=145, image_y=145, BAND=30
+data = data_hsi.reshape(np.prod(data_hsi.shape[:2]), np.prod(data_hsi.shape[2:]))  # np.prod()表示为所有元素的乘积(21025,200)
+gt = gt_hsi.reshape(np.prod(gt_hsi.shape[:2]), )  # (21025,0)
+classes_num = max(gt)  # 16
+print('The class numbers of the HSI data is:', classes_num)
+
+print('-----Importing Setting Parameters-----')
+iter = param_iter  # 分段循环
+patch_length = patch_size  #
+lr, num_epochs, batch_size = 0.001, 200, 32
+loss = torch.nn.CrossEntropyLoss()
+
+img_rows = 2 * patch_length + 1  # 图片的宽
+img_cols = 2 * patch_length + 1  # 图片的高
+img_channels = data_hsi.shape[2]  # 输入的通道数
+input_dimension = data_hsi.shape[2]  # 输入的维度
+ALL_SIZE = data_hsi.shape[0] * data_hsi.shape[1]
+val_size = int(train_size)
+test_size = total_size - train_size
+
+KAPPA = []
+OA = []
+AA = []
+TRAINING_TIME = []
+TESTING_TIME = []
+ELEMENT_ACC = np.zeros((iter, classes_num))
+
+data = preprocessing.scale(
+    data)  # 就是把数组的每一行单独拿出来，对于任意一行，分别求其均值（X_mean）和方差（X_std ），让这一行的每个数（X）减去X_mean后除以X_std，再放回原来的位置。
+# 可以理解为归一化的过程
+data_ = data.reshape(data_hsi.shape[0], data_hsi.shape[1], data_hsi.shape[2])
+whole_data = data_
+padded_data = np.lib.pad(
+    whole_data, ((patch_length, patch_length), (patch_length, patch_length),
+                 (0, 0)),
+    'constant',
+    constant_values=0)  # （元素，（上端补充行，左端补充列），（下端补充行，右端补充列））
+
+
+
+       
+
+model = HybridSN_network(BAND, classes_num).cuda()
+
+summary(model, (img_rows, img_cols, BAND))  # torchsummary能够查看模型的输入和输出的形状，可以更加清楚地输出模型的结构。
+
+
+# # Plotting
+
+
+def train(net, train_iter, valida_iter, loss, optimizer, device, epochs, early_stopping=True, early_num=20):
+    loss_list = [100]
+    early_epoch = 0
+
+    net = net.to(device)
+    print("training on ", device)
+    start = time.time()
+    train_loss_list = []
+    valida_loss_list = []
+    train_acc_list = []
+    valida_acc_list = []
+    for epoch in range(epochs):
+        train_acc_sum, n = 0.0, 0
+        time_epoch = time.time()
+        lr_adjust = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 15, eta_min=0.0, last_epoch=-1)
+        for X, y in train_iter:
+            batch_count, train_l_sum = 0, 0
+            # X = X.permute(0, 3, 1, 2)
+            X = X.to(device)
+            y = y.to(device)
+            y_hat = net(X)
+            # print('y_hat', y_hat)
+            # print('y', y)
+            l = loss(y_hat, y.long())
+
+            optimizer.zero_grad()
+            l.backward()
+            optimizer.step()
+            train_l_sum += l.cpu().item()
+            train_acc_sum += (y_hat.argmax(dim=1) == y).sum().cpu().item()
+            n += y.shape[0]
+            batch_count += 1
+        lr_adjust.step()
+        valida_acc, valida_loss = record.evaluate_accuracy(valida_iter, net, loss, device)
+        loss_list.append(valida_loss)
+
+        train_loss_list.append(train_l_sum)  # / batch_count)
+        train_acc_list.append(train_acc_sum / n)
+        valida_loss_list.append(valida_loss)
+        valida_acc_list.append(valida_acc)
+
+        print(
+            'epoch %d, train loss %.6f, train acc %.3f, valida loss %.6f, valida acc %.3f, time %.1f sec'
+            % (
+            epoch + 1, train_l_sum / batch_count, train_acc_sum / n, valida_loss, valida_acc, time.time() - time_epoch))
+
+        PATH = "./net_DBA.pt"
+        # if loss_list[-1] <= 0.01 and valida_acc >= 0.95:
+        #     torch.save(net.state_dict(), PATH)
+        #     break
+
+        if early_stopping and loss_list[-2] < loss_list[-1]:
+            if early_epoch == 0:  # and valida_acc > 0.9:
+                torch.save(net.state_dict(), PATH)
+            early_epoch += 1
+            loss_list[-1] = loss_list[-2]
+            if early_epoch == early_num:
+                net.load_state_dict(torch.load(PATH))
+                break
+        else:
+            early_epoch = 0
+
+    print('epoch %d, loss %.4f, train acc %.3f, time %.1f sec'
+          % (epoch + 1, train_l_sum / batch_count, train_acc_sum / n,
+             time.time() - start))
+
+
+for index_iter in range(iter):
+    print('iter:', index_iter)
+    # define the model
+    net = HybridSN_network(BAND, classes_num)  # 将hybridsn_network的数据过一遍
+
+    if param_optim == 'diffgrad':
+        optimizer = optim2.DiffGrad(
+            net.parameters(),
+            lr=lr,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0)  # weight_decay=0.0001)
+    if param_optim == 'adam':
+        optimizer = optim.Adam(
+            net.parameters(),
+            lr=1e-3,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0)
+    time_1 = int(time.time())
+    np.random.seed(seeds[index_iter])  # 按照seeds[index_iter]所给的信息，后续信息按照该值进行list排序的生成
+    # train_indices, test_indices = select(gt)
+    train_indices, test_indices = sampling(validation_split, gt)  # 获得了训练索引和测试索引
+    _, total_indices = sampling(1, gt)  # 获取全局的索引点，并将其打乱
+
+    train_size = len(train_indices)
+    print('Train size: ', train_size)  # 1018
+    test_size = total_size - train_size
+    print('Test size: ', test_size)  # 9231
+    val_size = int(train_size)
+    print('Validation size: ', val_size)
+
+    print('-----Selecting Small Pieces from the Original Cube Data-----')  # 从原始立方体数据中选择小块
+    train_iter, valida_iter, test_iter, all_iter = geniter.generate_iter(
+        train_size, train_indices, test_size, test_indices, total_size,
+        total_indices, val_size, whole_data, patch_length, padded_data,
+        input_dimension, 16, gt)  # batchsize in 1
+
+    tic1 = time.time()
+    train(net, train_iter, valida_iter, loss, optimizer, device, epochs=param_epoch)
+    toc1 = time.time()
+
+    pred_test = []
+    tic2 = time.time()
+    with torch.no_grad():
+        for X, y in test_iter:
+            X = X.to(device)
+            net.eval()
+            y_hat = net(X)
+            pred_test.extend(np.array(net(X).cpu().argmax(axis=1)))
+    toc2 = time.time()
+    collections.Counter(pred_test)
+    gt_test = gt[test_indices] - 1
+
+    overall_acc = metrics.accuracy_score(pred_test, gt_test[:-val_size])
+    confusion_matrix = metrics.confusion_matrix(pred_test, gt_test[:-val_size])
+    each_acc, average_acc = record.aa_and_each_accuracy(confusion_matrix)
+    kappa = metrics.cohen_kappa_score(pred_test, gt_test[:-val_size])
+
+    torch.save(net.state_dict(),
+               "./models/" + 'zhanshiinception_0.25' + str(round(overall_acc, 3)) + '.pt')
+    KAPPA.append(kappa)
+    OA.append(overall_acc)
+    AA.append(average_acc)
+    TRAINING_TIME.append(toc1 - tic1)
+    TESTING_TIME.append(toc2 - tic2)
+    ELEMENT_ACC[index_iter, :] = each_acc
+
+
+
+          
